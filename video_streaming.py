@@ -17,6 +17,8 @@ import sys
 import io
 import matplotlib.pyplot as plt
 import numpy as np
+import pyaudio
+import zlib
 
 
 # -----------------------
@@ -34,6 +36,13 @@ TYPE_FILE_CHUNK = b'FCH0'
 TYPE_TEXT       = b'TEX0'
 
 TYPE_IMAGE = b'IMG0'
+
+TYPE_AUDIO = b'AUD0'
+
+AUDIO_CHUNK = 1024
+AUDIO_FORMAT = pyaudio.paInt16
+AUDIO_CHANNELS = 1
+AUDIO_RATE = 44100
 
 # -----------------------
 # Helper functions
@@ -53,8 +62,7 @@ class VideoChatClient:
     def __init__(self, root):
         self.root = root
         self.root.title("1:1 Video Chat + File Transfer + Text Chat")
-        # 요구대로 전체 프레임 크기: 1200x720
-        self.root.geometry("1200x720")
+        self.root.geometry("1440x800+50+50")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         # Network
@@ -62,16 +70,35 @@ class VideoChatClient:
         self.running = False
         self.recv_thread = None
         self.recv_lock = threading.Lock()
+        self.connection_toggle_button = None
 
         # Camera
         self.cap = None
         self.sending_video = False
         self.capture_thread = None
+        self.cam_toggle_button = None
+
+        # Audio Play
+        self.sending_audio = False
+        self.audio = None
+        self.audio_in_stream = None
+        self.audio_out_stream = None
+        self.audio_thread = None
+        self.audio_toggle_button = None
+
+        self.audio = pyaudio.PyAudio()
+        self.audio_out_stream = self.audio.open(
+            format=AUDIO_FORMAT,
+            channels=AUDIO_CHANNELS,
+            rate=AUDIO_RATE,
+            output=True,
+            frames_per_buffer=AUDIO_CHUNK
+        )
 
         # Incoming file state
         self._incoming_file = None
 
-        # UI image references (keep to avoid GC)
+        # UI image references
         self._local_img_ref = None
         self._remote_img_ref = None
 
@@ -95,28 +122,40 @@ class VideoChatClient:
         self.ip_entry.insert(0, DEFAULT_SERVER_HOST)
         self.ip_entry.pack(side=tk.LEFT, padx=6)
 
-        tk.Button(group_conn, text="Connect", command=self.connect_server, bg="#8ee58e").pack(side=tk.LEFT, padx=6)
-        tk.Button(group_conn, text="Disconnect", command=self.disconnect_server, bg="#f5a3a3").pack(side=tk.LEFT, padx=6)
-
-       # Mode and file
+        self.connection_toggle_button = tk.Button(group_conn, 
+                                                  text="Connect", 
+                                                  command=self.toggle_connection, 
+                                                  bg="#8ee58e")
+        self.connection_toggle_button.pack(side=tk.LEFT, padx=6)
+        
+        # Mode and file
         group_mode = tk.LabelFrame(control_frame, text="Source", padx=6, pady=6)
         group_mode.pack(side=tk.LEFT, padx=6)
 
         self.combo_mode = ttk.Combobox(
             group_mode,
             values=["Camera", "Video File", "Image File", "Audio Visualizer"],
-            state="readonly", width=16
+            state="readonly", width=14
         )
         self.combo_mode.current(0)
         self.combo_mode.pack(side=tk.LEFT, padx=6)
 
-        tk.Button(group_mode, text="Start Camera", command=self.start_camera).pack(side=tk.LEFT, padx=6)
-        tk.Button(group_mode, text="Stop Camera", command=self.stop_camera).pack(side=tk.LEFT, padx=6)
+        self.cam_toggle_button = tk.Button(group_mode, 
+                                           text="Start Camera",
+                                           bg="#8ee58e",
+                                           command=self.toggle_camera)
+        self.cam_toggle_button.pack(side=tk.LEFT, padx=6)
+
+        self.audio_toggle_button = tk.Button(group_mode,
+                                             text="Start Mic",
+                                             bg="#8ee58e",
+                                             command=self.toggle_audio)
+        self.audio_toggle_button.pack(side=tk.LEFT, pady=6)
 
         tk.Button(group_mode, text="Load File", command=self.load_file).pack(side=tk.LEFT, padx=6)
         tk.Button(group_mode, text="Send File(Q)", command=self.compress_and_send_with_quality).pack(side=tk.LEFT, padx=6)
 
-        # ✔ 녹화 버튼은 반드시 여기!
+        # 녹화 버튼
         add_record_controls(group_mode, self)
 
         # Quality Test group
@@ -182,9 +221,7 @@ class VideoChatClient:
         self.status_bar = tk.Label(self.root, text="Ready.", bd=1, relief=tk.SUNKEN, anchor=tk.W, bg="#ddd", font=("Arial", 10))
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # -----------------------
     # Network functions
-    # -----------------------
     def connect_server(self):
         ip = self.ip_entry.get().strip()
         if not ip:
@@ -212,6 +249,22 @@ class VideoChatClient:
                 self.sock.close()
             except: pass
             self.sock = None
+    
+    def toggle_connection(self):
+        if self.sock:
+            self.disconnect_server()
+            if not self.sock:
+                self.connection_toggle_button.configure(
+                    text="Connect",
+                    bg="#8ee58e"
+                )
+        else:
+            self.connect_server()
+            if self.sock:
+                self.connection_toggle_button.configure(
+                    text="Disconnect",
+                    bg="#f5a3a3"
+                )
 
     def send_bytes(self, ttype, data_bytes):
         if not self.sock:
@@ -252,6 +305,8 @@ class VideoChatClient:
                     self.root.after(0, self.append_chat, f"Peer: {text}")
                 elif ttype == TYPE_IMAGE:
                     self.root.after(0, self._update_remote_image, payload)
+                elif ttype == TYPE_AUDIO:
+                    self.root.after(0, self._write_audio, payload)
                 elif ttype == TYPE_FILE_HDR:
                     try:
                         meta = json.loads(payload.decode('utf-8'))
@@ -338,7 +393,14 @@ class VideoChatClient:
                 self.send_bytes(TYPE_VIDEO, jpg.tobytes())
 
         self.append_chat_system("Camera stopped")
-
+    
+    def toggle_camera(self):
+        if self.sending_video:
+            self.stop_camera()
+            self.cam_toggle_button.configure(text="Start Camera", bg="#8ee58e")
+        else:
+            self.start_camera()
+            self.cam_toggle_button.configure(text="Stop Camera", bg="#f5a3a3")
 
     def capture_loop(self):
         while self.sending_video and self.cap:
@@ -384,8 +446,6 @@ class VideoChatClient:
         # 녹화는 여기서 실행해야 함 (try블록 바깥)
         handle_record_frame(self, frame)
 
-
-
     def _update_remote_image(self, jpeg_bytes):
         try:
             img = Image.open(io.BytesIO(jpeg_bytes)).convert('RGB')
@@ -420,6 +480,63 @@ class VideoChatClient:
         except Exception as e:
             print("Filter error:", e)
         return frame
+    
+    # ----------------------
+    # 오디오 buffer write
+    def start_audio(self):
+        if not self.audio_in_stream:
+            self.audio_in_stream = self.audio.open(
+                format=AUDIO_FORMAT,
+                channels=AUDIO_CHANNELS,
+                rate=AUDIO_RATE,
+                input=True,
+                frames_per_buffer=AUDIO_CHUNK
+            )
+        
+        self.sending_audio = True
+        self.audio_thread = threading.Thread(target=self.audio_loop, daemon=True)
+        self.audio_thread.start()
+        self.append_chat_system("Audio started")
+    
+    def stop_audio(self):
+        try:
+            if self.audio_in_stream:
+                self.audio_in_stream.close()
+            self.audio_in_stream = None
+        except Exception as e:
+            print("Stop audio Error in_stream:", e)
+            self.audio_in_stream = None
+        
+        self.sending_audio = False
+        self.append_chat_system("Audio Terminated")
+    
+    def toggle_audio(self):
+        if self.sending_audio:
+            self.stop_audio()
+            self.audio_toggle_button.configure(text="Start Mic", bg="#8ee58e")
+        else:
+            self.start_audio()
+            if self.sending_audio:
+                self.audio_toggle_button.configure(text="Stop Mic", bg="#f5a3a3")
+
+    def audio_loop(self):
+        try:
+            while self.audio_in_stream:
+                if self.audio_in_stream.is_stopped():
+                    break
+
+                cnk = self.audio_in_stream.read(AUDIO_CHUNK)
+                cnk = zlib.compress(cnk, level=1)
+                self.send_bytes(TYPE_AUDIO, cnk)
+
+        except Exception as e:
+            print("Audio Loop Exception:", e)
+
+    def _write_audio(self, payload):
+        audio_frame = zlib.decompress(payload)
+        audio_frame = (np.frombuffer(audio_frame, dtype=np.int16) * 3.0).astype(np.int16).tobytes()
+        self.audio_out_stream.write(audio_frame)
+        pass
 
     # -----------------------
     # Load File 버튼을 눌렀을 때 곧바로 품질 비교 + 압축 + 전송까지 실행
@@ -479,6 +596,7 @@ class VideoChatClient:
             f"원본: {original_size} bytes → 압축: {compressed_size} bytes\n"
             f"PSNR={psnr_val:.2f} dB / SSIM={ssim_val:.4f}"
         )
+    
     def load_file(self):
         """
         이미지/동영상 파일을 불러오고,
@@ -582,9 +700,7 @@ class VideoChatClient:
             h263_button.pack(side=tk.LEFT, padx=15)
             return
 
-        # -------------------------------
-        # 3) 잘못된 모드
-        # -------------------------------
+        # 잘못된 모드
         else:
             messagebox.showinfo("Load File", "Image File 또는 Video File 모드를 선택하세요.")
     
@@ -736,9 +852,7 @@ class VideoChatClient:
                 print("Chat send error:", e)
                 self.append_chat_system("Failed to send chat")
 
-    # -----------------------
     # UI callbacks
-    # -----------------------
     def update_quality(self, val):
         try:
             self.compression_quality = int(val)
@@ -753,9 +867,7 @@ class VideoChatClient:
         # Just indicate change; actual actions are via Load/Start
         self.append_chat_system(f"Mode changed to {self.combo_mode.get()}")
 
-    # -----------------------
     # Cleanup / Close
-    # -----------------------
     def close(self):
         # stop everything and quit
         self.append_chat_system("Closing application...")
